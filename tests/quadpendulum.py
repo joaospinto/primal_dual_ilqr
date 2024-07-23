@@ -82,9 +82,7 @@ def get_mass_inv(q):
 
 
 kinetic = lambda q, q_dot: 0.5 * jnp.vdot(q_dot, get_mass_matrix(q) @ q_dot)
-potential = lambda q: Mass * grav * q[1] + mass * grav * (
-    q[1] - L * jnp.cos(q[-1])
-)
+potential = lambda q: Mass * grav * q[1] + mass * grav * (q[1] - L * jnp.cos(q[-1]))
 lag = lambda q, q_dot: kinetic(q, q_dot) - potential(q)
 dL_dq = grad(lag, 0)
 
@@ -159,9 +157,7 @@ def obs_constraint(q):
     theta = q[2]
     phi = q[-1]
 
-    R = jnp.array(
-        [[jnp.cos(theta), -jnp.sin(theta)], [jnp.sin(theta), jnp.cos(theta)]]
-    )
+    R = jnp.array([[jnp.cos(theta), -jnp.sin(theta)], [jnp.sin(theta), jnp.cos(theta)]])
     pos_c = pos + R @ jnp.array([0.0, 0.15 * l])
     pole = (pos, pos + jnp.array([L * jnp.sin(phi), -L * jnp.cos(phi)]))
 
@@ -195,7 +191,6 @@ def cost(
     weights=(1.0, 1.0, 1.0),
     Q_T=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
 ):
-
     delta = state_wrap(x - goal)
     pos_cost = jnp.vdot(delta[:3], delta[:3]) + (1.0 + jnp.cos(x[3]))
     ctrl_cost = jnp.vdot(u - u_hover, u - u_hover)
@@ -216,9 +211,7 @@ def state_constraint(x, t, theta_lim=jnp.pi / 2.0):
     avoid_cons = obs_constraint(x[:4])
 
     # world_cons
-    world_cons = jnp.concatenate(
-        (x[:2] - world_range[0], world_range[1] - x[:2])
-    )
+    world_cons = jnp.concatenate((x[:2] - world_range[0], world_range[1] - x[:2]))
 
     return jnp.concatenate((theta_cons, world_cons, avoid_cons))
 
