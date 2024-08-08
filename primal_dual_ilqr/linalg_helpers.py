@@ -50,7 +50,7 @@ def _get_acceptable_psd_eigenvalue_shift(Q, k, delta):
 
 
 @partial(jit, static_argnames=("use_lapack", "iterate"))
-def project_psd_cone(Q, delta=0.0, use_lapack=True, iterate=True):
+def project_psd_cone(Q, delta=0.0, use_lapack=False, iterate=True):
     """Projects to the cone of positive semi-definite matrices.
 
     Args:
@@ -186,7 +186,7 @@ def solve_upper_unitriangular(U, b):
 
 
 @partial(jit, static_argnames=("use_lapack",))
-def solve_cholesky(A, b, use_lapack=True):
+def solve_cholesky(A, b, use_lapack=False):
     n, _ = A.shape
     if use_lapack:
         f = scipy.linalg.cho_factor(A)
@@ -198,7 +198,7 @@ def solve_cholesky(A, b, use_lapack=True):
 
 
 @partial(jit, static_argnames=("use_lapack",))
-def solve_symmetric_positive_definite_system(A, b, use_lapack=True):
+def solve_symmetric_positive_definite_system(A, b, use_lapack=False):
     n, _ = A.shape
     if n == 2:
         return _2x2_inv(A) @ b
@@ -206,6 +206,6 @@ def solve_symmetric_positive_definite_system(A, b, use_lapack=True):
 
 
 @partial(jit, static_argnames=("use_lapack",))
-def invert_symmetric_positive_definite_matrix(M, use_lapack=True):
+def invert_symmetric_positive_definite_matrix(M, use_lapack=False):
     n, _ = M.shape
     return solve_symmetric_positive_definite_system(M, np.eye(n), use_lapack)
