@@ -470,4 +470,6 @@ def primal_dual_ilqr(
         ),
     )
 
+    no_errors = np.logical_and(no_errors, iteration < max_iterations)
+
     return X, U, V, iteration, g, c, no_errors
