@@ -152,6 +152,23 @@ def merit_rho(c, dV):
 
 
 @jit
+def merit_function(V, g, c, rho):
+    return g + np.sum((V + 0.5 * rho * c) * c)
+
+
+@jit
+def merit_delta(new, old, rho):
+    V_n, g_n, c_n = new
+    V_o, g_o, c_o = old
+    cost_delta = g_n - g_o
+    al_delta = np.sum(V_o * c_o)
+    c_plus = c_n + c_o
+    c_minus = c_n - c_o
+    penalty_delta = 0.5 * rho * np.sum(c_plus * c_minus)
+    return cost_delta + al_delta + penalty_delta
+
+
+@jit
 def slope(dX, dU, dV, c, q, r, rho):
     """Determines the directional derivative of the merit function.
 
@@ -173,7 +190,7 @@ def slope(dX, dU, dV, c, q, r, rho):
 
 @partial(jit, static_argnums=(0, 1))
 def line_search(
-    merit_function,
+    rho,
     model_evaluator,
     X_in,
     U_in,
@@ -193,7 +210,7 @@ def line_search(
     """Performs a primal-dual line search on an augmented Lagrangian merit function.
 
     Args:
-      merit_function:  merit function mapping V, g, c to the merit scalar.
+      rho:             a parameter of the merit function.
       X_in:            [T+1, n]      numpy array.
       U_in:            [T, m]        numpy array.
       V_in:            [T+1, n]      numpy array.
@@ -219,19 +236,21 @@ def line_search(
     """
 
     def continuation_criterion(inputs):
-        _, _, _, _, _, new_merit, alpha = inputs
-        debug.print(f"{new_merit=}, {current_merit=}, {alpha=}, {merit_slope=}")
+        _, _, _, _, _, _, m_delta, alpha = inputs
+        debug.print(f"{m_delta=}, {current_merit=}, {alpha=}, {merit_slope=}")
         return np.logical_and(
-            new_merit > current_merit + alpha * armijo_factor * merit_slope,
+            m_delta > alpha * armijo_factor * merit_slope,
             alpha > alpha_min,
         )
 
     def body(inputs):
-        _, _, _, _, _, _, alpha = inputs
+        _, _, _, _, _, _, _, alpha = inputs
         alpha *= alpha_mult
         X_new = X_in + alpha * dX
         U_new = U_in + alpha * dU
         V_new = V_in
+        debug.print(f"{current_g=}")
+        debug.print(f"current_c_norm={np.linalg.norm(current_c)}")
         debug.print(f"X_new.norm={np.linalg.norm(X_new)}")
         debug.print(f"U_new.norm={np.linalg.norm(U_new)}")
         debug.print(f"V_new.norm={np.linalg.norm(V_new)}")
@@ -239,14 +258,15 @@ def line_search(
         debug.print(f"dU.norm={np.linalg.norm(dU)}")
         debug.print(f"dV.norm={np.linalg.norm(dV)}")
         new_g, new_c = model_evaluator(X_new, U_new)
-        new_merit = merit_function(V_new, new_g, new_c)
+        new_merit = merit_function(V_new, new_g, new_c, rho)
         new_merit = np.where(np.isnan(new_merit), current_merit, new_merit)
-        return X_new, U_new, V_new, new_g, new_c, new_merit, alpha
+        m_delta = merit_delta((V_new, new_g, new_c), (V_in, current_g, current_c), rho)
+        return X_new, U_new, V_new, new_g, new_c, new_merit, m_delta, alpha
 
-    X, U, V, new_g, new_c, _, alpha = lax.while_loop(
+    X, U, V, new_g, new_c, _, _, alpha = lax.while_loop(
         continuation_criterion,
         body,
-        (X_in, U_in, V_in, current_g, current_c, np.inf, alpha_0 / alpha_mult),
+        (X_in, U_in, V_in, current_g, current_c, np.inf, np.inf, alpha_0 / alpha_mult),
     )
 
     debug.print(
@@ -337,10 +357,6 @@ def primal_dual_ilqr(
     model_evaluator = partial(model_evaluator_helper, cost, dynamics, x0)
 
     @jit
-    def merit_function(V, g, c, rho):
-        return g + np.sum((V + 0.5 * rho * c) * c)
-
-    @jit
     def direction_and_merit(X, U, V, g, c):
         # dX, dU, dV, q, r = compute_search_direction_kkt(
         #     cost,
@@ -401,7 +417,7 @@ def primal_dual_ilqr(
         debug.print(f"Constraint violation norm: {np.sum(c * c)}")
 
         X_new, U_new, V_new, g_new, c_new, no_errors = line_search(
-            partial(merit_function, rho=rho),
+            rho,
             model_evaluator,
             X,
             U,
