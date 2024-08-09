@@ -1,4 +1,4 @@
-from jax import jit, lax, vmap
+from jax import debug, jit, lax, vmap
 
 import jax.numpy as np
 
@@ -9,15 +9,15 @@ from trajax.optimizers import vectorize
 from primal_dual_ilqr.optimizers import primal_dual_ilqr
 
 
-@partial(
-    jit,
-    static_argnums=(
-        0,
-        1,
-        6,
-        7,
-    ),
-)
+# @partial(
+#     jit,
+#     static_argnums=(
+#         0,
+#         1,
+#         6,
+#         7,
+#     ),
+# )
 def constrained_primal_dual_ilqr(
     cost,
     dynamics,
@@ -170,6 +170,7 @@ def constrained_primal_dual_ilqr(
             alpha_mult,
             alpha_min,
         )
+        debug.print(f"no_errors coming out of unconstrained iLQR solve: {no_errors}")
 
         # evalute constraints
         U_pad = pad(U)

@@ -219,7 +219,7 @@ def line_search(
 
     def continuation_criterion(inputs):
         _, _, _, _, _, new_merit, alpha = inputs
-        # debug.print(f"{new_merit=}, {current_merit=}, {alpha=}, {merit_slope=}")
+        debug.print(f"{new_merit=}, {current_merit=}, {alpha=}, {merit_slope=}")
         return np.logical_and(
             new_merit > current_merit + alpha * armijo_factor * merit_slope,
             alpha > alpha_min,
@@ -231,6 +231,12 @@ def line_search(
         X_new = X_in + alpha * dX
         U_new = U_in + alpha * dU
         V_new = V_in + alpha * dV
+        debug.print(f"X_new.norm={np.linalg.norm(X_new)}")
+        debug.print(f"U_new.norm={np.linalg.norm(U_new)}")
+        debug.print(f"V_new.norm={np.linalg.norm(V_new)}")
+        debug.print(f"dX.norm={np.linalg.norm(dX)}")
+        debug.print(f"dU.norm={np.linalg.norm(dU)}")
+        debug.print(f"dV.norm={np.linalg.norm(dV)}")
         new_g, new_c = model_evaluator(X_new, U_new)
         new_merit = merit_function(V_new, new_g, new_c)
         new_merit = np.where(np.isnan(new_merit), current_merit, new_merit)
@@ -242,9 +248,9 @@ def line_search(
         (X_in, U_in, V_in, current_g, current_c, np.inf, alpha_0 / alpha_mult),
     )
 
-    # debug.print(
-    #     f"{new_g=}, c_sq_norm={np.sum(new_c * new_c)}, {merit_slope=}, {alpha=}"
-    # )
+    debug.print(
+        f"{new_g=}, c_sq_norm={np.sum(new_c * new_c)}, {merit_slope=}, {alpha=}"
+    )
 
     no_errors = alpha > alpha_min
 
@@ -277,7 +283,7 @@ def model_evaluator_helper(cost, dynamics, x0, X, U):
     return g, c
 
 
-@partial(jit, static_argnums=(0, 1))
+# @partial(jit, static_argnums=(0, 1))
 def primal_dual_ilqr(
     cost,
     dynamics,
@@ -370,15 +376,16 @@ def primal_dual_ilqr(
             rho,
         )
 
-        # @jit
-        # def f(x):
-        #     gg, cc = model_evaluator(X + x * dX, U + x * dU)
-        #     return merit_function(V + x * dV, gg, cc, rho)
-        # auto_merit_slope = grad(f)(0.0)
+        @jit
+        def f(x):
+            gg, cc = model_evaluator(X + x * dX, U + x * dU)
+            return merit_function(V + x * dV, gg, cc, rho)
 
-        # debug.print(f"{auto_merit_slope=}")
-        # debug.print(f"{merit_slope=}")
-        # debug.print(f"MERIT FUNCTION SLOPE ERROR: {auto_merit_slope - merit_slope}")
+        auto_merit_slope = grad(f)(0.0)
+
+        debug.print(f"{auto_merit_slope=}")
+        debug.print(f"{merit_slope=}")
+        debug.print(f"MERIT FUNCTION SLOPE ERROR: {auto_merit_slope - merit_slope}")
 
         # merit_slope = auto_merit_slope
 
@@ -387,6 +394,8 @@ def primal_dual_ilqr(
     def body(inputs):
         """Solves LQR subproblem and returns updated trajectory."""
         X, U, V, dX, dU, dV, iteration, _, g, c, rho, merit, merit_slope = inputs
+
+        debug.print(f"Constraint violation norm: {np.sum(c * c)}")
 
         X_new, U_new, V_new, g_new, c_new, no_errors = line_search(
             partial(merit_function, rho=rho),
@@ -406,6 +415,8 @@ def primal_dual_ilqr(
             alpha_mult,
             alpha_min,
         )
+
+        debug.print(f"no_errors coming out of line search: {no_errors}")
 
         (
             dX_new,
