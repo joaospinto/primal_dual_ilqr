@@ -357,7 +357,7 @@ def primal_dual_ilqr(
     model_evaluator = partial(model_evaluator_helper, cost, dynamics, x0)
 
     @jit
-    def direction_and_merit(X, U, V, g, c):
+    def direction_and_merit(X, U, V, g, c, rho0):
         # dX, dU, dV, q, r = compute_search_direction_kkt(
         #     cost,
         #     dynamics,
@@ -381,7 +381,7 @@ def primal_dual_ilqr(
             psd_delta,
         )
 
-        rho = merit_rho(c, dV)
+        rho = np.max(np.array([merit_rho(c, dV), rho0]))
 
         merit = merit_function(V, g, c, rho)
 
@@ -444,7 +444,7 @@ def primal_dual_ilqr(
             rho_new,
             merit_new,
             merit_slope_new,
-        ) = direction_and_merit(X_new, U_new, V_new, g_new, c_new)
+        ) = direction_and_merit(X_new, U_new, V_new, g_new, c_new, rho)
 
         return (
             X_new,
@@ -478,7 +478,7 @@ def primal_dual_ilqr(
 
     g, c = model_evaluator(X_in, U_in)
 
-    dX, dU, dV, rho, merit, merit_slope = direction_and_merit(X_in, U_in, V_in, g, c)
+    dX, dU, dV, rho, merit, merit_slope = direction_and_merit(X_in, U_in, V_in, g, c, 0)
 
     X, U, V, _, _, _, iteration, no_errors, g, c, _, _, merit_slope = lax.while_loop(
         continuation_criterion,
