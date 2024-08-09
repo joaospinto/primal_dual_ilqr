@@ -167,7 +167,8 @@ def slope(dX, dU, dV, c, q, r, rho):
     Returns:
         dir_derivative: the directional derivative.
     """
-    return np.sum(q * dX) + np.sum(r * dU) + np.sum(dV * c) - rho * np.sum(c * c)
+    # return np.sum(q * dX) + np.sum(r * dU) + np.sum(dV * c) - rho * np.sum(c * c)
+    return np.sum(q * dX) + np.sum(r * dU) - rho * np.sum(c * c)
 
 
 @partial(jit, static_argnums=(0, 1))
@@ -230,7 +231,7 @@ def line_search(
         alpha *= alpha_mult
         X_new = X_in + alpha * dX
         U_new = U_in + alpha * dU
-        V_new = V_in + alpha * dV
+        V_new = V_in
         debug.print(f"X_new.norm={np.linalg.norm(X_new)}")
         debug.print(f"U_new.norm={np.linalg.norm(U_new)}")
         debug.print(f"V_new.norm={np.linalg.norm(V_new)}")
@@ -253,6 +254,8 @@ def line_search(
     )
 
     no_errors = alpha > alpha_min
+
+    V = V_in + alpha * dV
 
     return X, U, V, new_g, new_c, no_errors
 
