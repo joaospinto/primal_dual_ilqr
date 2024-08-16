@@ -148,7 +148,9 @@ def merit_rho(c, dV):
     """
     c2 = np.sum(c * c)
     dV2 = np.sum(dV * dV)
-    return lax.select(c2 > 1e-12, 2.0 * np.sqrt(dV2 / c2), 1e-2)
+    rho = lax.select(c2 > 1e-16, 2.0 * np.sqrt(dV2 / c2), 1e-2)
+    debug.print(f"new {rho=}")
+    return rho
 
 
 @jit
@@ -165,7 +167,9 @@ def merit_delta(new, old, rho):
     c_plus = c_n + c_o
     c_minus = c_n - c_o
     penalty_delta = 0.5 * rho * np.sum(c_plus * c_minus)
-    return cost_delta + al_delta + penalty_delta
+    m_delta = cost_delta + al_delta + penalty_delta
+    debug.print(f"{m_delta=}, {cost_delta=}, {al_delta=}, {penalty_delta=}")
+    return m_delta
 
 
 @jit
