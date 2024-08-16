@@ -18,14 +18,15 @@ from .linalg_helpers import (
 from .primal_tvlqr import tvlqr, tvlqr_gpu, rollout, rollout_gpu
 
 
-def lagrangian(cost, dynamics, x0):
+def lagrangian(cost, dynamics, inequality_constraint, x0):
     """Returns a function to evaluate the associated Lagrangian."""
 
-    def fun(x, u, t, v, v_prev):
+    def fun(x, u, t, v, v_prev, z, s):
         c1 = cost(x, u, t)
         c2 = np.dot(v, dynamics(x, u, t))
         c3 = np.dot(v_prev, lax.select(t == 0, x0 - x, -x))
-        return c1 + c2 + c3
+        c4 = np.dot(inequality_constraint(x, u, t) + s, z)
+        return c1 + c2 + c3 + c4
 
     return fun
 
@@ -63,51 +64,92 @@ def regularize(Q, R, M, make_psd, psd_delta):
     return Q, R
 
 
-@partial(jit, static_argnums=(0, 1))
+@partial(jit, static_argnums=(0, 1, 2))
 def compute_search_direction(
     cost,
     dynamics,
+    inequality_constraint,
     x0,
     X,
     U,
     V,
+    Z,
+    S,
     c,
+    c_ineq,
+    mu,
     make_psd,
     psd_delta,
 ):
     """Computes the SQP search direction.
 
     Args:
-      cost:          cost function with signature cost(x, u, t).
-      dynamics:      dynamics function with signature dynamics(x, u, t).
-      x0:            [n]           numpy array.
-      X:             [T+1, n]      numpy array.
-      U:             [T, m]        numpy array.
-      V:             [T+1, n]      numpy array.
-      c:             [T+1, n]      numpy array.
-      make_psd:      whether to zero negative eigenvalues after quadratization.
-      psd_delta:     the minimum eigenvalue post PSD cone projection.
+      cost:                   cost function with signature cost(x, u, t).
+      dynamics:               dynamics function with signature dynamics(x, u, t).
+      x0:                     [n]             numpy array.
+      X:                      [T+1, n]        numpy array.
+      U:                      [T, m]          numpy array.
+      V:                      [T+1, n]        numpy array.
+      Z:                      [T+1, c_I_dim]  numpy array.
+      S:                      [T+1, c_I_dim]  numpy array.
+      inequality_constraint:  inequality_constraint(x, u, t) <= 0 returns
+      c:                      [T+1, n]        numpy array.
+      c_ineq:                 [T+1, c_dim]    numpy array.
+      mu:                     a scalar parameter weighing the barrier term in the objective.
+      make_psd:               whether to zero negative eigenvalues after quadratization.
+      psd_delta:              the minimum eigenvalue post PSD cone projection.
 
     Returns:
-      dX: [T+1, n] numpy array.
-      dU: [T, m]   numpy array.
-      q: [T+1, n]  numpy array.
-      r: [T, m]    numpy array.
+      dX: [T+1, n]         numpy array.
+      dU: [T, m]           numpy array.
+      dV:  [T+1, n]        numpy array.
+      dZ:  [T+1, c_I_dim]  numpy array.
+      dS:  [T+1, c_I_dim]  numpy array.
+      dL: scalar.
     """
     T = U.shape[0]
 
     pad = lambda A: np.pad(A, [[0, 1], [0, 0]])
 
-    quadratizer = quadratize(lagrangian(cost, dynamics, x0), argnums=5)
-    Q, R_pad, M_pad = quadratizer(X, pad(U), np.arange(T + 1), pad(V[1:]), V)
+    inequality_linearizer = linearize(inequality_constraint)
+    J_x, J_u = inequality_linearizer(X, pad(U), np.arange(T + 1))
+
+    E_diag = vmap(lambda t: Z[t] / S[t])(np.arange(T + 1))
+    E = vmap(lambda t: np.diag(E_diag[t]))(np.arange(T + 1))
+
+    quadratizer = quadratize(
+        lagrangian(cost, dynamics, inequality_constraint, x0), argnums=7
+    )
+    Q, R_pad, M_pad = quadratizer(X, pad(U), np.arange(T + 1), pad(V[1:]), V, Z, S)
+
+    Q = Q + vmap(lambda t: J_x[t].T @ E[t] @ J_x[t])(np.arange(T + 1))
+    M_pad = M_pad + vmap(lambda t: +J_x[t].T @ E[t] @ J_u[t])(np.arange(T + 1))
+    R_pad = R_pad + vmap(lambda t: +J_u[t].T @ E[t] @ J_u[t])(np.arange(T + 1))
 
     R = R_pad[:-1]
     M = M_pad[:-1]
 
     Q, R = regularize(Q, R, M, make_psd, psd_delta)
 
-    linearizer = linearize(lagrangian(cost, dynamics, x0), argnums=5)
-    q, r_pad = linearizer(X, pad(U), np.arange(T + 1), pad(V[1:]), V)
+    linearizer = linearize(
+        lagrangian(cost, dynamics, inequality_constraint, x0), argnums=7
+    )
+    lagrangian_q, lagrangian_r_pad = linearizer(
+        X, pad(U), np.arange(T + 1), pad(V[1:]), V, Z, S
+    )
+    lagrangian_r = lagrangian_r_pad[:-1]
+
+    e = np.ones(S.shape[1])
+    q_r_mod_common = vmap(
+        lambda t: np.diag(1.0 / S[t])
+        @ (-(S[t] * Z[t] - mu * e) + np.diag(Z[t]) @ (c_ineq[t] + S[t]))
+    )(np.arange(T + 1))
+
+    q = lagrangian_q + vmap(lambda t: J_x[t].T @ q_r_mod_common[t])(np.arange(T + 1))
+    r_pad = lagrangian_r_pad + vmap(lambda t: J_u[t].T @ q_r_mod_common[t])(
+        np.arange(T + 1)
+    )
+
     r = r_pad[:-1]
 
     dynamics_linearizer = linearize(dynamics)
@@ -122,6 +164,12 @@ def compute_search_direction(
     dV = dual_lqr(dX, P, p)
     # dV = dual_lqr_backward(Q, q, M, A, dX, dU)
     # dV = dual_lqr_gpu(Q, q, M, A, dX, dU)
+    dS = vmap(lambda t: -(c_ineq[t] + S[t]) - J_x[t] @ dX[t] - J_u[t] @ dU[t])(
+        np.arange(T + 1)
+    )
+    dZ = vmap(lambda t: np.diag(-1.0 / S[t]) @ (S[t] * Z[t] - mu * e + Z[t] * dS[t]))(
+        np.arange(T + 1)
+    )
 
     # new_dX, new_dU, new_dV, LHS, rhs = tvlqr_kkt(Q, q, R, r, M, A, B, c[1:], c[0])
 
@@ -132,42 +180,52 @@ def compute_search_direction(
 
     # return new_dX, new_dU, new_dV, q, r
 
-    return dX, dU, dV, q, r
+    dLdX = np.sum(dX * lagrangian_q)
+    dLdU = np.sum(dU * lagrangian_r)
+    dLdV = np.sum(dV * c)
+    dLdZ = np.sum(dZ * (c_ineq + S))
+    dLdS = np.sum(Z - mu / S)
+    dL = dLdX + dLdU + dLdV + dLdZ + dLdS
+
+    return dX, dU, dV, dZ, dS, dL
 
 
 @jit
-def merit_rho(c, dV):
+def merit_rho(c, d, dS, dL, old_rho):
     """Determines the merit function penalty parameter to be used.
 
     Args:
-      c:             [T+1, n]  numpy array.
-      dV:            [T+1, n]  numpy array.
+      c:   [T+1, n]      numpy array.
+      d:   [T+1, c_dim]  numpy array.
+      dS:  [T+1, c_dim]  numpy array.
+      dL:  the directional derivative of the Lagrangian.
 
     Returns:
         rho: the penalty parameter.
     """
-    c2 = np.sum(c * c)
-    dV2 = np.sum(dV * dV)
-    return lax.select(c2 > 1e-12, 2.0 * np.sqrt(dV2 / c2), 1e-2)
+    min_rho = -dL / (-np.sum(c * c) - np.sum(d * d) + np.sum(dS * d))
+    return np.maximum(0.5 * old_rho, 2.0 * min_rho)
 
 
 @jit
-def slope(dX, dU, dV, c, q, r, rho):
+def slope(dX, dU, dV, dZ, dS, c, d, dL, rho):
     """Determines the directional derivative of the merit function.
 
     Args:
-      dX: [T+1, n] numpy array.
-      dU: [T, m]   numpy array.
-      dV: [T+1, n] numpy array.
-      c:  [T+1, n] numpy array.
-      q:  [T+1, n] numpy array.
-      r:  [T, m] numpy array.
-      rho: the penalty parameter of the merit function.
+      dX:      [T+1, n] numpy array.
+      dU:      [T, m]   numpy array.
+      dV:      [T+1, n] numpy array.
+      dZ:      [T+1, c_dim] numpy array.
+      dS:      [T+1, c_dim] numpy array.
+      c:       [T+1, n] numpy array.
+      c_ineq:  [T+1, c_dim] numpy array.
+      dL:      the directional derivative of the Lagrangian.
+      rho:     the penalty parameter of the merit function.
 
     Returns:
-        dir_derivative: the directional derivative.
+        dir_derivative: the directional derivative of the merit function.
     """
-    return np.sum(q * dX) + np.sum(r * dU) + np.sum(dV * c) - rho * np.sum(c * c)
+    return dL - rho * np.sum(c * c) - rho * np.sum(d * d) + rho * np.sum(dS * d)
 
 
 @partial(jit, static_argnums=(0, 1))
@@ -177,12 +235,17 @@ def line_search(
     X_in,
     U_in,
     V_in,
+    Z_in,
+    S_in,
     dX,
     dU,
     dV,
+    dZ,
+    dS,
     current_merit,
     current_g,
     current_c,
+    current_c_ineq,
     merit_slope,
     armijo_factor,
     alpha_0,
@@ -211,14 +274,17 @@ def line_search(
     Returns:
       X: [T+1, n]     numpy array, representing the optimal state trajectory.
       U: [T, m]       numpy array, representing the optimal control trajectory.
-      V: [T+1, n]     numpy array, representing the optimal multiplier trajectory.
+      V: [T+1, n]     numpy array, representing the optimal equality multiplier trajectory.
+      Z: [T+1, n]     numpy array, representing the optimal inequality multiplier trajectory.
+      S: [T+1, n]     numpy array, representing the optimal slack variable trajectory.
       new_g:          the cost value at the new X, U, V.
-      new_c:          the constraint values at the new X, U, V.
-      no_errors:       whether no error occurred during the line search.
+      new_c:          the equality constraint values at the new X, U, V.
+      new_c_ineq:     the inequality constraint values at the new X, U, V.
+      no_errors:      whether no error occurred during the line search.
     """
 
     def continuation_criterion(inputs):
-        _, _, _, _, _, new_merit, alpha = inputs
+        _, _, _, _, _, _, _, _, new_merit, alpha = inputs
         # debug.print(f"{new_merit=}, {current_merit=}, {alpha=}, {merit_slope=}")
         return np.logical_and(
             new_merit > current_merit + alpha * armijo_factor * merit_slope,
@@ -226,20 +292,45 @@ def line_search(
         )
 
     def body(inputs):
-        _, _, _, _, _, _, alpha = inputs
+        _, _, _, _, _, _, _, _, _, alpha = inputs
         alpha *= alpha_mult
         X_new = X_in + alpha * dX
         U_new = U_in + alpha * dU
         V_new = V_in + alpha * dV
-        new_g, new_c = model_evaluator(X_new, U_new)
-        new_merit = merit_function(V_new, new_g, new_c)
-        new_merit = np.where(np.isnan(new_merit), current_merit, new_merit)
-        return X_new, U_new, V_new, new_g, new_c, new_merit, alpha
+        Z_new = Z_in + alpha * dZ
+        S_new = S_in + alpha * dS
 
-    X, U, V, new_g, new_c, _, alpha = lax.while_loop(
+        new_g, new_c, new_c_ineq = model_evaluator(X_new, U_new)
+        new_merit = merit_function(V_new, Z_new, new_g, new_c, new_c_ineq + S_new)
+        new_merit = np.where(np.isnan(new_merit), current_merit, new_merit)
+        return (
+            X_new,
+            U_new,
+            V_new,
+            Z_new,
+            S_in,
+            new_g,
+            new_c,
+            new_c_ineq,
+            new_merit,
+            alpha,
+        )
+
+    X, U, V, Z, S, new_g, new_c, new_c_ineq, _, alpha = lax.while_loop(
         continuation_criterion,
         body,
-        (X_in, U_in, V_in, current_g, current_c, np.inf, alpha_0 / alpha_mult),
+        (
+            X_in,
+            U_in,
+            V_in,
+            Z_in,
+            S_in,
+            current_g,
+            current_c,
+            current_c_ineq,
+            np.inf,
+            alpha_0 / alpha_mult,
+        ),
     )
 
     # debug.print(
@@ -248,19 +339,21 @@ def line_search(
 
     no_errors = alpha > alpha_min
 
-    return X, U, V, new_g, new_c, no_errors
+    return X, U, V, Z, S, new_g, new_c, new_c_ineq, no_errors
 
 
-@partial(jit, static_argnums=(0, 1))
-def model_evaluator_helper(cost, dynamics, x0, X, U):
+@partial(jit, static_argnums=(0, 1, 2))
+def model_evaluator_helper(cost, dynamics, inequality_constraint, x0, X, U):
     """Evaluates the costs and constraints based on the provided primal variables.
 
     Args:
-      cost:            cost function with signature cost(x, u, t).
-      dynamics:        dynamics function with signature dynamics(x, u, t).
-      x0:              [n]           numpy array.
-      X:               [T+1, n]      numpy array.
-      U:               [T, m]        numpy array.
+      cost:                   cost function with signature cost(x, u, t).
+      dynamics:               dynamics function with signature dynamics(x, u, t).
+      inequality_constraint:  inequality_constraint(x, u, t) <= 0 returns
+                              (num_inequality, ) nd array.
+      x0:                     [n]           numpy array.
+      X:                      [T+1, n]      numpy array.
+      U:                      [T, m]        numpy array.
 
     Returns:
       g: the cost value (a scalar).
@@ -274,7 +367,335 @@ def model_evaluator_helper(cost, dynamics, x0, X, U):
     residual_fn = lambda t: dynamics(X[t], U[t], t) - X[t + 1]
     c = np.vstack([x0 - X[0], vmap(residual_fn)(np.arange(T))])
 
-    return g, c
+    c_ineq = vmap(lambda t: inequality_constraint(X[t], U[t], t))(np.arange(T + 1))
+
+    return g, c, c_ineq
+
+
+@jit
+def get_mu(S, Z):
+    if S.size == 0:
+        return 0.0
+    P = S * Z
+    dot = np.sum(P)
+    m = P.size
+    eps = m * P.min() / dot
+    sigma = 0.1 * np.minimum(0.05 * (1 - eps) / eps, 2) ** 3
+    return sigma * dot / m
+
+
+@partial(jit, static_argnums=(0, 1, 2))
+def constrained_primal_dual_ilqr(
+    cost,
+    dynamics,
+    inequality_constraint,
+    x0,
+    X_in,
+    U_in,
+    V_in,
+    Z_in,
+    max_iterations=100,
+    slope_threshold=1e-4,
+    var_threshold=0.0,
+    c_sq_threshold=1e-4,
+    make_psd=True,
+    psd_delta=1e-6,
+    armijo_factor=1e-4,
+    alpha_0=1.0,
+    alpha_mult=0.5,
+    alpha_min=5e-5,
+):
+    """Implements the Primal-Dual iLQR algorithm.
+
+    Args:
+      cost:                   cost function with signature cost(x, u, t).
+      dynamics:               dynamics function with signature dynamics(x, u, t).
+      inequality_constraint:  inequality_constraint(x, u, t) <= 0 returns
+                              (num_inequality, ) nd array.
+      x0:                     [n]           numpy array.
+      X_in:                   [T+1, n]      numpy array.
+      U_in:                   [T, m]        numpy array.
+      V_in:                   [T+1, n]      numpy array.
+      Z_in:                   [T, c_dim]    numpy array.
+      max_iterations:         maximum iterations.
+      slope_threshold:        tolerance for stopping optimization.
+      var_threshold:          tolerance on primal and dual variables for stopping optimization.
+      c_sq_threshold:         tolerance on squared constraint violations for stopping optimization.
+      make_psd:               whether to zero negative eigenvalues after quadratization.
+      psd_delta:              the minimum eigenvalue post PSD cone projection.
+      armijo_factor:          the Armijo parameter to be used in the line search.
+      alpha_0:                initial line search value.
+      alpha_mult:             a constant in (0, 1) that gets multiplied to alpha to update it.
+      alpha_min:              minimum line search value.
+
+    Returns:
+      X: [T+1, n]        numpy array, representing the optimal state trajectory.
+      U: [T, m]          numpy array, representing the optimal control trajectory.
+      V: [T+1, n]        numpy array, representing the optimal multiplier trajectory.
+      num_iterations:    the number of iterations upon convergence.
+      final_cost:        the cost at the optimal state and control trajectory.
+      final_constraints: the constraints at the optimal state and control trajectory.
+      no_errors:         whether no errors were encountered during the solve.
+    """
+    model_evaluator = partial(
+        model_evaluator_helper, cost, dynamics, inequality_constraint, x0
+    )
+
+    T = U_in.shape[0]
+
+    S = vmap(lambda t: inequality_constraint(X_in[t], U_in[t], t))(np.arange(T + 1))
+    S = np.maximum(S, 1e-2 * np.ones_like(S))
+
+    Z_in = np.maximum(Z_in, 1e-2 * np.ones_like(Z_in))
+
+    rho = 0.0
+
+    @jit
+    def merit_function(V, Z, g, c, d, rho):
+        return g + np.sum((V + 0.5 * rho * c) * c) + np.sum((Z + 0.5 * rho * d) * d)
+
+    @jit
+    def direction_and_merit(X, U, V, Z, S, g, c, c_ineq, rho):
+        # dX, dU, dV, q, r = compute_search_direction_kkt(
+        #     cost,
+        #     dynamics,
+        #     x0,
+        #     X,
+        #     U,
+        #     V,
+        #     make_psd,
+        #     psd_delta,
+        # )
+
+        mu = get_mu(S, Z)
+
+        dX, dU, dV, dZ, dS, dL = compute_search_direction(
+            cost,
+            dynamics,
+            inequality_constraint,
+            x0,
+            X,
+            U,
+            V,
+            Z,
+            S,
+            c,
+            c_ineq,
+            mu,
+            make_psd,
+            psd_delta,
+        )
+
+        d = c_ineq + S
+
+        rho = merit_rho(c, d, dS, dL, rho)
+
+        merit = merit_function(V, Z, g, c, d, rho)
+
+        merit_slope = slope(
+            dX,
+            dU,
+            dV,
+            dZ,
+            dS,
+            c,
+            d,
+            dL,
+            rho,
+        )
+
+        # @jit
+        # TODO(joao): correct this commented out code to account for our changes.
+        # def f(x):
+        #     gg, cc = model_evaluator(X + x * dX, U + x * dU)
+        #     return merit_function(V + x * dV, gg, cc, rho)
+        # auto_merit_slope = grad(f)(0.0)
+
+        # debug.print(f"{auto_merit_slope=}")
+        # debug.print(f"{merit_slope=}")
+        # debug.print(f"MERIT FUNCTION SLOPE ERROR: {auto_merit_slope - merit_slope}")
+
+        # merit_slope = auto_merit_slope
+
+        return dX, dU, dV, dZ, dS, rho, merit, merit_slope
+
+    def body(inputs):
+        """Solves LQR subproblem and returns updated trajectory."""
+        (
+            X,
+            U,
+            V,
+            Z,
+            S,
+            dX,
+            dU,
+            dV,
+            dZ,
+            dS,
+            iteration,
+            _,
+            g,
+            c,
+            c_ineq,
+            rho,
+            merit,
+            merit_slope,
+        ) = inputs
+
+        X_new, U_new, V_new, Z_new, S_new, g_new, c_new, c_ineq_new, no_errors = (
+            line_search(
+                partial(merit_function, rho=rho),
+                model_evaluator,
+                X,
+                U,
+                V,
+                Z,
+                S,
+                dX,
+                dU,
+                dV,
+                dZ,
+                dS,
+                merit,
+                g,
+                c,
+                c_ineq,
+                merit_slope,
+                armijo_factor,
+                alpha_0,
+                alpha_mult,
+                alpha_min,
+            )
+        )
+
+        (
+            dX_new,
+            dU_new,
+            dV_new,
+            dZ_new,
+            dS_new,
+            rho_new,
+            merit_new,
+            merit_slope_new,
+        ) = direction_and_merit(
+            X_new, U_new, V_new, Z_new, S_new, g_new, c_new, c_ineq_new, rho
+        )
+
+        return (
+            X_new,
+            U_new,
+            V_new,
+            Z_new,
+            S_new,
+            dX_new,
+            dU_new,
+            dV_new,
+            dZ_new,
+            dS_new,
+            iteration + 1,
+            no_errors,
+            g_new,
+            c_new,
+            c_ineq_new,
+            rho_new,
+            merit_new,
+            merit_slope_new,
+        )
+
+    def continuation_criterion(inputs):
+        (
+            _,
+            _,
+            _,
+            _,
+            _,
+            dX,
+            dU,
+            dV,
+            dZ,
+            dS,
+            iteration,
+            no_errors,
+            _,
+            c,
+            c_ineq,
+            _,
+            _,
+            slope,
+        ) = inputs
+
+        c_sq_norm = np.sum(c * c)
+        c_ineq_viol = np.maximum(c_ineq, np.zeros_like(c_ineq))
+        c_ineq_norm = np.sum(c_ineq_viol * c_ineq_viol)
+        slope_ok = np.abs(slope) > slope_threshold
+        delta_norm_sq = (
+            np.sum(dX * dX)
+            + np.sum(dU * dU)
+            + np.sum(dV * dV)
+            + np.sum(dZ * dZ)
+            + np.sum(dS * dS)
+        )
+        delta_norm_ok = delta_norm_sq > var_threshold**2
+        c_ok = np.logical_and(c_sq_norm > c_sq_threshold, c_ineq_norm > c_sq_threshold)
+        progress_ok = np.logical_or(np.logical_and(slope_ok, delta_norm_ok), c_ok)
+
+        status_ok = np.logical_and(no_errors, iteration < max_iterations)
+
+        return np.logical_and(status_ok, progress_ok)
+
+    g, c, c_ineq = model_evaluator(X_in, U_in)
+
+    dX, dU, dV, dZ, dS, rho, merit, merit_slope = direction_and_merit(
+        X_in, U_in, V_in, Z_in, S, g, c, c_ineq, rho
+    )
+
+    (
+        X,
+        U,
+        V,
+        Z,
+        S,
+        _,
+        _,
+        _,
+        _,
+        _,
+        iteration,
+        no_errors,
+        g,
+        c,
+        c_ineq,
+        _,
+        _,
+        merit_slope,
+    ) = lax.while_loop(
+        continuation_criterion,
+        body,
+        (
+            X_in,
+            U_in,
+            V_in,
+            S,
+            Z_in,
+            dX,
+            dU,
+            dV,
+            dZ,
+            dS,
+            0,
+            True,
+            g,
+            c,
+            c_ineq,
+            rho,
+            merit,
+            merit_slope,
+        ),
+    )
+
+    no_errors = np.logical_and(no_errors, iteration < max_iterations)
+
+    return X, U, V, Z, S, iteration, g, c, c_ineq, no_errors
 
 
 @partial(jit, static_argnums=(0, 1))
@@ -299,22 +720,22 @@ def primal_dual_ilqr(
     """Implements the Primal-Dual iLQR algorithm.
 
     Args:
-      cost:            cost function with signature cost(x, u, t).
-      dynamics:        dynamics function with signature dynamics(x, u, t).
-      x0:              [n]           numpy array.
-      X_in:            [T+1, n]      numpy array.
-      U_in:            [T, m]        numpy array.
-      V_in:            [T+1, n]      numpy array.
-      max_iterations:  maximum iterations.
-      slope_threshold: tolerance for stopping optimization.
-      var_threshold:   tolerance on primal and dual variables for stopping optimization.
-      c_sq_threshold:  tolerance on squared constraint violations for stopping optimization.
-      make_psd:        whether to zero negative eigenvalues after quadratization.
-      psd_delta:       the minimum eigenvalue post PSD cone projection.
-      armijo_factor:   the Armijo parameter to be used in the line search.
-      alpha_0:         initial line search value.
-      alpha_mult:      a constant in (0, 1) that gets multiplied to alpha to update it.
-      alpha_min:       minimum line search value.
+      cost:                   cost function with signature cost(x, u, t).
+      dynamics:               dynamics function with signature dynamics(x, u, t).
+      x0:                     [n]           numpy array.
+      X_in:                   [T+1, n]      numpy array.
+      U_in:                   [T, m]        numpy array.
+      V_in:                   [T+1, n]      numpy array.
+      max_iterations:         maximum iterations.
+      slope_threshold:        tolerance for stopping optimization.
+      var_threshold:          tolerance on primal and dual variables for stopping optimization.
+      c_sq_threshold:         tolerance on squared constraint violations for stopping optimization.
+      make_psd:               whether to zero negative eigenvalues after quadratization.
+      psd_delta:              the minimum eigenvalue post PSD cone projection.
+      armijo_factor:          the Armijo parameter to be used in the line search.
+      alpha_0:                initial line search value.
+      alpha_mult:             a constant in (0, 1) that gets multiplied to alpha to update it.
+      alpha_min:              minimum line search value.
 
     Returns:
       X: [T+1, n]        numpy array, representing the optimal state trajectory.
@@ -325,151 +746,24 @@ def primal_dual_ilqr(
       final_constraints: the constraints at the optimal state and control trajectory.
       no_errors:         whether no errors were encountered during the solve.
     """
-    model_evaluator = partial(model_evaluator_helper, cost, dynamics, x0)
-
-    @jit
-    def merit_function(V, g, c, rho):
-        return g + np.sum((V + 0.5 * rho * c) * c)
-
-    @jit
-    def direction_and_merit(X, U, V, g, c):
-        # dX, dU, dV, q, r = compute_search_direction_kkt(
-        #     cost,
-        #     dynamics,
-        #     x0,
-        #     X,
-        #     U,
-        #     V,
-        #     make_psd,
-        #     psd_delta,
-        # )
-
-        dX, dU, dV, q, r = compute_search_direction(
-            cost,
-            dynamics,
-            x0,
-            X,
-            U,
-            V,
-            c,
-            make_psd,
-            psd_delta,
-        )
-
-        rho = merit_rho(c, dV)
-
-        merit = merit_function(V, g, c, rho)
-
-        merit_slope = slope(
-            dX,
-            dU,
-            dV,
-            c,
-            q,
-            r,
-            rho,
-        )
-
-        # @jit
-        # def f(x):
-        #     gg, cc = model_evaluator(X + x * dX, U + x * dU)
-        #     return merit_function(V + x * dV, gg, cc, rho)
-        # auto_merit_slope = grad(f)(0.0)
-
-        # debug.print(f"{auto_merit_slope=}")
-        # debug.print(f"{merit_slope=}")
-        # debug.print(f"MERIT FUNCTION SLOPE ERROR: {auto_merit_slope - merit_slope}")
-
-        # merit_slope = auto_merit_slope
-
-        return dX, dU, dV, rho, merit, merit_slope
-
-    def body(inputs):
-        """Solves LQR subproblem and returns updated trajectory."""
-        X, U, V, dX, dU, dV, iteration, _, g, c, rho, merit, merit_slope = inputs
-
-        X_new, U_new, V_new, g_new, c_new, no_errors = line_search(
-            partial(merit_function, rho=rho),
-            model_evaluator,
-            X,
-            U,
-            V,
-            dX,
-            dU,
-            dV,
-            merit,
-            g,
-            c,
-            merit_slope,
-            armijo_factor,
-            alpha_0,
-            alpha_mult,
-            alpha_min,
-        )
-
-        (
-            dX_new,
-            dU_new,
-            dV_new,
-            rho_new,
-            merit_new,
-            merit_slope_new,
-        ) = direction_and_merit(X_new, U_new, V_new, g_new, c_new)
-
-        return (
-            X_new,
-            U_new,
-            V_new,
-            dX_new,
-            dU_new,
-            dV_new,
-            iteration + 1,
-            no_errors,
-            g_new,
-            c_new,
-            rho_new,
-            merit_new,
-            merit_slope_new,
-        )
-
-    def continuation_criterion(inputs):
-        _, _, _, dX, dU, dV, iteration, no_errors, _, c, _, _, slope = inputs
-
-        c_sq_norm = np.sum(c * c)
-        slope_ok = np.abs(slope) > slope_threshold
-        delta_norm_sq = np.sum(dX * dX) + np.sum(dU * dU) + np.sum(dV * dV)
-        delta_norm_ok = delta_norm_sq > var_threshold**2
-        c_ok = c_sq_norm > c_sq_threshold
-        progress_ok = np.logical_or(np.logical_and(slope_ok, delta_norm_ok), c_ok)
-
-        status_ok = np.logical_and(no_errors, iteration < max_iterations)
-
-        return np.logical_and(status_ok, progress_ok)
-
-    g, c = model_evaluator(X_in, U_in)
-
-    dX, dU, dV, rho, merit, merit_slope = direction_and_merit(X_in, U_in, V_in, g, c)
-
-    X, U, V, _, _, _, iteration, no_errors, g, c, _, _, merit_slope = lax.while_loop(
-        continuation_criterion,
-        body,
-        (
-            X_in,
-            U_in,
-            V_in,
-            dX,
-            dU,
-            dV,
-            0,
-            True,
-            g,
-            c,
-            rho,
-            merit,
-            merit_slope,
-        ),
+    X, U, V, _, _, iteration, g, c, _, no_errors = constrained_primal_dual_ilqr(
+        cost=cost,
+        dynamics=dynamics,
+        inequality_constraint=lambda x, u, t: np.empty(0),
+        x0=x0,
+        X_in=X_in,
+        U_in=U_in,
+        V_in=V_in,
+        Z_in=np.empty([X_in.shape[0], 0]),
+        max_iterations=max_iterations,
+        slope_threshold=slope_threshold,
+        var_threshold=var_threshold,
+        c_sq_threshold=c_sq_threshold,
+        make_psd=make_psd,
+        psd_delta=psd_delta,
+        armijo_factor=armijo_factor,
+        alpha_0=alpha_0,
+        alpha_mult=alpha_mult,
+        alpha_min=alpha_min,
     )
-
-    no_errors = np.logical_and(no_errors, iteration < max_iterations)
-
     return X, U, V, iteration, g, c, no_errors

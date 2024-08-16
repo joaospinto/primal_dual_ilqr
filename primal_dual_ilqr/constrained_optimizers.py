@@ -25,8 +25,8 @@ def constrained_primal_dual_ilqr(
     X_in,
     U_in,
     V_in,
-    equality_constraint=lambda x, u, t: np.empty(1),
-    inequality_constraint=lambda x, u, t: np.empty(1),
+    equality_constraint=lambda x, u, t: np.empty(0),
+    inequality_constraint=lambda x, u, t: np.empty(0),
     max_iterations=100,
     max_al_iterations=5,
     slope_threshold=1e-4,
@@ -179,9 +179,20 @@ def constrained_primal_dual_ilqr(
         inequality_constraints = inequality_constraint_mapped(X, U_pad, t_range)
         inequality_constraints_projected = inequality_projection(inequality_constraints)
 
+        equality_max_viol = (
+            0
+            if equality_constraints.size == 0
+            else np.max(np.abs(equality_constraints))
+        )
+        inequality_max_viol = (
+            0
+            if inequality_constraints_projected.size == 0
+            else np.max(inequality_constraints_projected)
+        )
+
         max_constraint_violation = np.maximum(
-            np.max(np.abs(equality_constraints)),
-            np.max(inequality_constraints_projected),
+            equality_max_viol,
+            inequality_max_viol,
         )
 
         max_dynamics_violation_sq = np.sum(c * c)
